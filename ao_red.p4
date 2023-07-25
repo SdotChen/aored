@@ -9,7 +9,7 @@
 #define POWER 0
 #define FREQ 1 << POWER
 #define RECIRC_PORT 68
-#define WQ 9
+#define WQ 9 
 /*************************************************************************
  ***********************  H E A D E R S  *********************************
  *************************************************************************/
@@ -49,11 +49,11 @@ header udp_h {
 header p4_header_h {
 	bit<32>	 delay;
 	bit<32>	 depth;
-	bit<32>	 recirc;
+	bit<32>	 recirc; // optional, to see the sequence of recirculate packet
 	bit<7>	 pad2;
-	bit<9>	 egress_port;
+	bit<9>	 egress_port; // parsed in `uint16_t` so padding is needed
 	bit<16>	 drop_prob;
-	bit<32>	 aver_qdepth;
+	bit<32>	 aver_qdepth; // optional, to see the average depth
 	bit<8>	 color;
 }
 
@@ -68,18 +68,18 @@ struct dual_32 {
     /***********************  H E A D E R S  ************************/
 
 struct my_ingress_headers_t {
-    ethernet_h   ethernet;
-    ipv4_h       ipv4;
-	udp_h		 udp;
-    p4_header_h  p4_header;
+    ethernet_h	ethernet;
+    ipv4_h		ipv4;
+	udp_h		udp;
+    p4_header_h	p4_header;
 }
 
     /******  G L O B A L   I N G R E S S   M E T A D A T A  *********/
 
 struct my_ingress_metadata_t {
-	bit<16>	 rndnum;
-	bit<16>  drop_prob;
-	bit<16>  diff;
+	bit<16>	rndnum;
+	bit<16>	drop_prob;
+	bit<16> diff;
 }
 
     /***********************  P A R S E R  **************************/
@@ -144,10 +144,10 @@ control Ingress(
 	Random<bit<16>>() rnd;
 	Meter<bit<9>>(512,MeterType_t.BYTES) aqm_meter;
 
-    action multicast(bit<9> port){
-	    ig_tm_md.mcast_grp_a = (bit<16>)port;
+	action multicast(bit<9> port){
+		ig_tm_md.mcast_grp_a = (bit<16>)port;
 		hdr.p4_header.egress_port = port;
-    }
+	}
 
 	action drop(){
 		ig_dprsr_md.drop_ctl = 1;
@@ -177,12 +177,12 @@ control Ingress(
 		hdr.p4_header.aver_qdepth = 0;
     }
 
-    @stage(1)
-    table set_p4_header_t {
-        actions = {set_p4_header;}
-        default_action = set_p4_header();
-        size = 1;
-    }
+	@stage(1)
+	table set_p4_header_t {
+	    actions = {set_p4_header;}
+	    default_action = set_p4_header();
+	    size = 1;
+	}
 
 	action set_meter() {
 		hdr.p4_header.color = aqm_meter.execute(hdr.p4_header.egress_port);
@@ -241,7 +241,7 @@ control Ingress(
 	}
 
 	action get_diff(){
-		meta.diff = (bit<16>)meta.rndnum |-| meta.drop_prob;
+		meta.diff = meta.rndnum |-| meta.drop_prob;
 	}
 
 	@stage(5)
@@ -326,11 +326,11 @@ control Ingress(
 		size = 1;
 	}
 
-    apply {
+	apply {
 		/*
 			To check if a packet is from regular port or recirculate port.
 		*/
-        if(ig_intr_md.ingress_port == RECIRC_PORT) {
+		if(ig_intr_md.ingress_port == RECIRC_PORT) {
 			drop_recirc_t.apply();
 		} else {
 			multicast_t.apply(); // stage 0
@@ -352,7 +352,10 @@ control Ingress(
 			get_aver_qdepth_t.apply(); // stage 3
 		}
 
-		// Only for packets from regular port.
+		/*
+			Only for packets from regular port. 
+			If they are marked red color, they will be limited.
+		*/
 		if(hdr.p4_header.color[1:1] == 1) {
 			get_rndnum_t.apply(); // stage 4
 			get_diff_t.apply(); // stage 5
@@ -397,7 +400,7 @@ struct my_egress_headers_t {
 struct my_egress_metadata_t {
 	bit<32> sum_qdepth;
 	bit<32>	weighted_qdepth;
-	bit<2>	option;
+	bit<2>	option; // without sampling can set `bit<1>`
 	bit<32> num_writer;
 	bit<32> num_reader;
 	bit<1>	drop_recirc;
@@ -415,12 +418,12 @@ parser EgressParser(packet_in        pkt,
     out egress_intrinsic_metadata_t  eg_intr_md)
 {
     /* This is a mandatory state, required by Tofino Architecture */
-    state start {
-        pkt.extract(eg_intr_md);
+	state start {
+		pkt.extract(eg_intr_md);
 		pkt.extract(hdr.ethernet);
 		pkt.extract(hdr.ipv4);
 		transition meta_init;		
-    }
+	}
 
 	state meta_init {
 		meta.sum_qdepth = 0;
@@ -442,10 +445,10 @@ parser EgressParser(packet_in        pkt,
 		transition parse_p4_header;
 	}
 
-    state parse_p4_header {
+	state parse_p4_header {
 		pkt.extract(hdr.p4_header);
-        transition accept;
-    }
+		transition accept;
+	}
 }
 
     /***************** M A T C H - A C T I O N  *********************/
@@ -488,7 +491,7 @@ control Egress(
 	RegisterAction<bit<32>,bit<9>,bit<2>>(reg_process) _process = {
 		void apply(inout bit<32> reg_data, out bit<2> result) {
 			if(eg_intr_md.egress_port != RECIRC_PORT) {
-				if(reg_data >= FREQ) {
+				if(reg_data >= FREQ) { // Without sampling, this branch will always hit.
 					reg_data = 1;
 					result = 0;
 				} else {
@@ -678,19 +681,31 @@ control Egress(
 
 	@stage(8)
 	table map_qdepth_to_prob_t {
-		//key = {meta.qdepth_for_match: range;}
 		key = {meta.qdepth_for_match: exact;}
-		//key = { hdr.p4_header.aver_qdepth: range;}
 		actions = { map_qdepth_to_prob;}
 		default_action = map_qdepth_to_prob(65535);
 		size = 65536;
 	}
 
 	apply {
-		
+		/*
+			Update the fields we care to parse.
+		*/
 		mod_dst_mac_t.apply(); // stage 0 
 		mod_header_t.apply(); // stage 0
 
+		/*
+			Get the option to execute different actions:
+				If the option is an even (0 or 2): user's packets
+					We used to consider to average the qdepth of a certain number of packets. (We want it to fluctuate mildly.) 
+					In default settings, it will always be zero as the POWER is 0.
+				If the option is an odd (1): recirculate packets
+
+			"Writer" means the sequence of user's packets, and "Reader" means the "sequence" of recirculated packets.
+				As the maximum bandwidth of recirculate port is higher than that of regular ports (100GE), about 1.5x (tested in Flnet S9280).
+				It is likely that consequtive recirculated packets carry the same value, the qdepth of last user's packet, which is meaningless.
+			Therefore, we drop a portion of recirculated packets.
+		*/
 		process_t.apply(); // stage 1
 		if(meta.option % 2 == 0) {
 			set_writer_t.apply(); // stage 2
